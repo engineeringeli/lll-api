@@ -1,1 +1,7 @@
 openai==1.51.0
+fastapi
+uvicorn[standard]
+
+fastapi
+uvicorn[standard]
+psycopg[binary]==3.1.18
