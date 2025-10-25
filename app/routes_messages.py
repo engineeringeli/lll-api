@@ -1,0 +1,390 @@
+# backend/app/routes_messages.py
+
+from fastapi import APIRouter, Depends, HTTPException, Body, Query
+from psycopg import Connection
+from psycopg.types.json import Json
+from datetime import datetime, timezone, timedelta
+import os, secrets, re
+
+from app.deps import get_db
+from app.decisions import should_autosend
+from app.followups import generate_initial_docs_request, _portal_url as build_portal_url
+from app.queue import get_queue
+from app.jobs import send_message_and_update
+
+router = APIRouter(prefix="/messages", tags=["messages"])
+
+# Toggle: send inline on approve (bypasses worker). Defaults ON for reliability during demo.
+INLINE_APPROVE_SEND = os.getenv("INLINE_APPROVE_SEND", "1").lower() in ("1","true","yes","on")
+
+# -----------------------------
+# Helpers
+# -----------------------------
+def _org_settings(db: Connection) -> dict:
+    row = db.execute("SELECT * FROM org_settings LIMIT 1;").fetchone()
+    if not row:
+        return {
+            "require_approval_initial": True,
+            "autosend_confidence_threshold": 0.85,
+            "business_hours_tz": "America/Los_Angeles",
+            "business_hours_start": 8,
+            "business_hours_end": 18,
+            "cooldown_hours": 22,
+            "max_daily_sends": 2,
+            "grace_minutes": 5,
+        }
+    return dict(row)
+def _draft_initial_docs_request(contact_id: str, db: Connection):
+    # Load contact
+    c = db.execute("SELECT * FROM contacts WHERE id=%s;", (contact_id,)).fetchone()
+    if not c:
+        raise HTTPException(404, "contact not found")
+    if c.get("dnc"):
+        raise HTTPException(400, "contact is DNC")
+    c = dict(c)
+
+    # Build portal link (creates/extends token)
+    portal = build_portal_url(db, contact_id, None)  # None -> use PORTAL_BASE
+
+    # Required & pending labels
+    rows = db.execute(
+        """
+        SELECT dr.label
+          FROM client_documents cd
+          JOIN document_requirements dr ON dr.id = cd.requirement_id
+         WHERE cd.contact_id = %s
+           AND COALESCE(cd.is_required, dr.is_required) = TRUE
+           AND cd.status = 'PENDING'
+         ORDER BY dr.label;
+        """,
+        (contact_id,),
+    ).fetchall()
+    labels = [r["label"] for r in rows]
+
+    # Org settings (for tone/signature, etc.)
+    org = _org_settings(db)
+
+    # ✨ AI-generate the draft
+    gen = generate_initial_docs_request(db, c, labels, portal, org)
+    body = _finalize_body(db, gen["body"])  # keep your signature logic
+    subject = gen["subject"]
+
+    drafted_meta = {
+        "intent": gen.get("intent", "initial_docs_request"),
+        "subject": subject,
+        "confidence": gen.get("confidence", 0.92),
+        "labels_included": labels,
+        "_llm": gen.get("_llm"),
+    }
+
+    draft_row = db.execute(
+        "INSERT INTO messages(contact_id, channel, direction, body, meta) "
+        "VALUES (%s,'EMAIL','DRAFT',%s,%s) RETURNING id;",
+        (contact_id, body, Json(drafted_meta)),
+    ).fetchone()
+    draft_id = str(draft_row["id"])
+
+    db.execute(
+        "INSERT INTO timeline(contact_id,type,detail) "
+        "VALUES(%s,'NOTE','Drafted initial docs request (AI)');",
+        (contact_id,),
+    )
+    db.commit()
+
+    return {"ok": True, "draft_id": draft_id, "auto_enqueued": False}
+
+def _signature_block(db: Connection) -> str:
+    row = db.execute("""
+      SELECT COALESCE(include_signature, true) AS include_signature,
+             outbound_from_name,
+             outbound_signature
+      FROM org_settings LIMIT 1;
+    """).fetchone() or {}
+    if not row or not row["include_signature"]:
+        return ""
+    name = (row.get("outbound_from_name") or "").strip()
+    sig  = (row.get("outbound_signature") or "").strip()
+    parts = [p for p in [name, sig] if p]
+    return "\n".join(parts)
+
+def _finalize_body(db: Connection, body: str) -> str:
+    body = re.sub(r"\[[^\]]+\]", "", body).strip()
+    sig = _signature_block(db)
+    return f"{body}\n\n{sig}".strip() if sig else body
+
+def _portal_url(db: Connection, contact_id: str, base: str) -> str:
+    tok = db.execute(
+        "SELECT token FROM portal_tokens WHERE contact_id=%s AND (expires_at IS NULL OR expires_at>now()) LIMIT 1",
+        (contact_id,),
+    ).fetchone()
+    if tok:
+        token = tok["token"]
+    else:
+        token = secrets.token_urlsafe(24)
+        exp = datetime.now(timezone.utc) + timedelta(days=30)
+        db.execute(
+            "INSERT INTO portal_tokens(token, contact_id, expires_at) VALUES (%s,%s,%s)",
+            (token, contact_id, exp),
+        )
+    return f"{base.rstrip('/')}/portal/{token}"
+
+def _missing_labels(db: Connection, contact_id: str) -> list[str]:
+    rows = db.execute(
+        """
+        SELECT dr.label
+          FROM client_documents cd
+          JOIN document_requirements dr ON dr.id = cd.requirement_id
+         WHERE cd.contact_id = %s
+           AND COALESCE(cd.is_required, dr.is_required) = TRUE
+           AND cd.status = 'PENDING'
+         ORDER BY dr.label;
+        """,
+        (contact_id,),
+    ).fetchall()
+    return [r["label"] for r in rows]
+
+def _contact(db: Connection, contact_id: str):
+    row = db.execute("SELECT * FROM contacts WHERE id = %s;", (contact_id,)).fetchone()
+    if not row:
+        raise HTTPException(404, "contact not found")
+    return dict(row)
+
+# -----------------------------
+# Thread loaders
+# -----------------------------
+@router.get("/thread/{contact_id}")
+def get_thread(contact_id: str, db: Connection = Depends(get_db)):
+    contact = _contact(db, contact_id)
+    msgs = db.execute(
+        """
+        SELECT id, channel, direction, body, meta, created_at
+        FROM messages
+        WHERE contact_id = %s
+        ORDER BY created_at ASC;
+        """,
+        (contact_id,),
+    ).fetchall()
+    return {"contact": contact, "messages": msgs}
+
+@router.get("/thread/by-message/{message_id}")
+def thread_by_message(
+    message_id: str,
+    db: Connection = Depends(get_db),
+    fallback_contact_id: str | None = Query(default=None),
+):
+    rec = db.execute(
+        """
+        SELECT
+          m.id AS mid,
+          m.contact_id AS m_contact_id,
+          c.id AS cid,
+          c.first_name, c.last_name, c.email, c.phone, c.matter_type
+        FROM messages m
+        LEFT JOIN contacts c ON c.id = m.contact_id
+        WHERE m.id = %s;
+        """,
+        (message_id,),
+    ).fetchone()
+    if not rec:
+        raise HTTPException(404, detail=f"message not found: {message_id}")
+
+    if not rec["cid"]:
+        if not fallback_contact_id:
+            raise HTTPException(404, detail=f"contact not found for message {message_id} (contact_id={rec['m_contact_id']})")
+        c2 = db.execute(
+            "SELECT id, first_name, last_name, email, phone, matter_type FROM contacts WHERE id = %s;",
+            (fallback_contact_id,),
+        ).fetchone()
+        if not c2:
+            raise HTTPException(404, detail=f"fallback_contact_id does not exist: {fallback_contact_id}")
+        db.execute("UPDATE messages SET contact_id = %s WHERE id = %s;", (fallback_contact_id, message_id))
+        db.commit()
+        contact = dict(c2)
+        contact_id = c2["id"]
+    else:
+        contact = {
+            "id": rec["cid"],
+            "first_name": rec["first_name"],
+            "last_name": rec["last_name"],
+            "email": rec["email"],
+            "phone": rec["phone"],
+            "matter_type": rec["matter_type"],
+        }
+        contact_id = rec["cid"]
+
+    messages = db.execute(
+        """
+        SELECT id, channel, direction, body, created_at
+        FROM messages
+        WHERE contact_id = %s
+        ORDER BY created_at ASC;
+        """,
+        (contact_id,),
+    ).fetchall()
+    return {"contact": contact, "messages": messages}
+
+# -----------------------------
+# Draft creation (initial outreach)
+# -----------------------------
+
+@router.post("/draft-initial-docs/{contact_id}")
+def draft_initial_docs_route(contact_id: str, db: Connection = Depends(get_db)):
+    return _draft_initial_docs_request(contact_id, db)
+
+@router.post("/draft-initial/{contact_id}")
+def draft_initial(contact_id: str, payload: dict = Body(default={}), db: Connection = Depends(get_db)):
+    # Reuse the AI helper to create the draft
+    created = _draft_initial_docs_request(contact_id, db)
+    draft_id = created["draft_id"]
+
+    # Auto-send decision for *initial* messages
+    c = db.execute("SELECT dnc, last_sent_at, sends_today FROM contacts WHERE id=%s;", (contact_id,)).fetchone()
+    if not c:
+        raise HTTPException(404, "contact not found")
+    org = _org_settings(db)
+
+    allowed, decision_meta, when = should_autosend(
+        {
+            "org": {
+                "require_approval_initial": org["require_approval_initial"],
+                "autosend_confidence_threshold": float(org["autosend_confidence_threshold"]),
+                "business_hours_tz": org["business_hours_tz"],
+                "business_hours_start": org["business_hours_start"],
+                "business_hours_end": org["business_hours_end"],
+                "cooldown_hours": org["cooldown_hours"],
+                "max_daily_sends": org["max_daily_sends"],
+                "grace_minutes": org["grace_minutes"],
+            },
+            "contact": {
+                "dnc": c["dnc"],
+                "last_sent_at": c["last_sent_at"],
+                "sends_today": c["sends_today"],
+            },
+            # You could also pass through the AI meta if you want
+            "drafted": {"intent": "initial_docs_request", "confidence": 0.92},
+            "is_initial": True,
+            "now_utc": datetime.now(timezone.utc),
+        }
+    )
+
+    db.execute(
+        "INSERT INTO timeline(contact_id,type,detail) VALUES (%s,'AUTO_SEND_DECISION',%s);",
+        (contact_id, Json({"message_id": draft_id, **(decision_meta or {})})),
+    )
+    db.commit()
+
+    if not allowed:
+        return {"ok": True, "draft_id": draft_id, "auto_enqueued": False}
+
+    # enqueue or schedule
+    q = get_queue()
+    now_utc = datetime.now(timezone.utc)
+    if when and when > now_utc:
+        try:
+            from rq.scheduler import Scheduler
+            scheduler = Scheduler("outbound", connection=q.connection)
+            scheduler.enqueue_at(when, "app.jobs.send_message_and_update", draft_id, "EMAIL")
+            return {"ok": True, "draft_id": draft_id, "auto_enqueued": True, "scheduled_for": when.isoformat()}
+        except Exception:
+            pass
+
+    q.enqueue("app.jobs.send_message_and_update", draft_id, "EMAIL")
+    return {"ok": True, "draft_id": draft_id, "auto_enqueued": True}
+# -----------------------------
+# Draft update (edit/save)
+# -----------------------------
+@router.post("/draft-update/{message_id}")
+def update_draft_post(message_id: str, payload: dict = Body(...), db: Connection = Depends(get_db)):
+    new_body = (payload.get("body") or "").strip()
+    if not new_body:
+        raise HTTPException(400, "body required")
+
+    row = db.execute(
+        """
+        UPDATE messages
+           SET body = %s
+         WHERE id = %s
+           AND direction = 'DRAFT'
+        RETURNING id, contact_id, channel, direction, body, created_at;
+        """,
+        (new_body, message_id),
+    ).fetchone()
+    if not row:
+        raise HTTPException(404, "draft not found")
+
+    db.commit()
+    return {"ok": True, "message": row}
+
+# -----------------------------
+# Approve & send (inline by default)
+# -----------------------------
+@router.post("/approve/{message_id}")
+def approve_and_send(message_id: str, db: Connection = Depends(get_db)):
+    """
+    Approve a DRAFT; prefer worker enqueue.
+    If enqueue fails, do an inline send+finalize so the draft still flips.
+    """
+    row = db.execute(
+        "SELECT id, contact_id, channel, direction FROM messages WHERE id=%s;",
+        (message_id,)
+    ).fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="message not found")
+
+    if row["direction"] != "DRAFT":
+        # Already flipped by worker or previous action
+        return {"ok": True, "already_sent": True}
+
+    # timeline note
+    db.execute(
+        "INSERT INTO timeline(contact_id, type, detail) VALUES (%s,'NOTE','Draft approved by user');",
+        (row["contact_id"],)
+    )
+    db.commit()
+
+    # Try to enqueue
+    try:
+        q = get_queue()
+        q.enqueue("app.jobs.send_message_and_update", row["id"], row["channel"])
+        return {"ok": True, "queued": True}
+    except Exception as e_enqueue:
+        # Inline fallback: call the same worker function synchronously
+        try:
+            from app.jobs import send_message_and_update as _inline_send
+            result = _inline_send(row["id"], row["channel"])
+            return {"ok": True, "queued": False, "result": result}
+        except Exception as e_inline:
+            # Show both errors in detail so you can see *why* it failed
+            raise HTTPException(
+                status_code=500,
+                detail=f"Queue failed: {repr(e_enqueue)} | Inline send failed: {repr(e_inline)}"
+            )
+# -----------------------------
+# (Optional) Scheduler helpers
+# -----------------------------
+@router.post("/run-nudges-now")
+def run_nudges_now():
+    q = get_queue()
+    job = q.enqueue("app.jobs.nudge_missing_docs")
+    return {"enqueued": True, "job_id": job.id}
+
+@router.post("/schedule-nudges")
+def schedule_nudges():
+    try:
+        from rq_scheduler import Scheduler as RQScheduler
+    except Exception:
+        raise HTTPException(
+            400,
+            "rq-scheduler not installed. `pip install rq-scheduler` and run `rqscheduler --url \"$REDIS_URL\"`."
+        )
+
+    q = get_queue()
+    scheduler = RQScheduler(queue=q)
+    start_utc = datetime.utcnow() + timedelta(seconds=10)
+    job = scheduler.schedule(
+        scheduled_time=start_utc,
+        func="app.jobs.nudge_missing_docs",
+        interval=60 * 60 * 24,
+        repeat=None,
+    )
+    return {"scheduled": True, "first_run_utc": start_utc, "job_id": job.id}
