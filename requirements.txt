@@ -1,13 +1,9 @@
-openai==1.51.0
-fastapi
-uvicorn[standard]
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
 psycopg[binary]==3.1.18
-redis>=5.0
-rq>=1.15           # only if you enqueue jobs with RQ (you do in main.py)
-
-
+redis==5.0.8
+rq==1.15.1
 requests>=2.31
-
 twilio>=9.0.0
-
 python-multipart>=0.0.9
+email-validator>=2.0.0
