@@ -9,3 +9,5 @@ rq>=1.15           # only if you enqueue jobs with RQ (you do in main.py)
 requests>=2.31
 
 twilio>=9.0.0
+
+python-multipart>=0.0.9
