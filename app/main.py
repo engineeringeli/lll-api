@@ -54,6 +54,73 @@ def healthz():
 def health():
     return {"ok": True}
 
+def _mask_url(url: str) -> str:
+    if not url:
+        return ""
+    try:
+        # rediss://:password@host:port
+        if "://" in url and "@" in url:
+            scheme, rest = url.split("://", 1)
+            if "@" in rest:
+                _, host = rest.split("@", 1)
+                return f"{scheme}://****:****@{host}"
+        return url
+    except Exception:
+        return "<masked>"
+
+@app.get("/health/env")
+def health_env():
+    keys = [
+        "DATABASE_URL",
+        "REDIS_URL",
+        "INLINE_APPROVE_SEND",
+        "ALLOW_LOCALHOST",
+        "PORTAL_BASE",
+        "UPLOADS_BUCKET",
+    ]
+    out = {}
+    for k in keys:
+        v = os.getenv(k, "")
+        out[k] = _mask_url(v) if "URL" in k else (v if v else "")
+    return {"env": out}
+
+@app.get("/health/redis")
+def health_redis():
+    url = os.getenv("REDIS_URL", "")
+    if not url:
+        return {"ok": False, "error": "REDIS_URL missing"}
+    try:
+        r = redis.from_url(url, decode_responses=True)
+        ok = r.ping()
+        # show basic rq info if present
+        q_key = "rq:queue:outbound"
+        q_len = r.llen(q_key) if r.exists(q_key) else 0
+        workers = r.smembers("rq:workers") if r.exists("rq:workers") else set()
+        return {
+            "ok": bool(ok),
+            "redis_url": _mask_url(url),
+            "rq_queue_outbound_len": q_len,
+            "rq_workers_seen": sorted(list(workers))[:10],
+        }
+    except Exception as e:
+        return {"ok": False, "redis_url": _mask_url(url), "error": str(e)}
+
+@app.get("/health/db")
+def health_db():
+    url = os.getenv("DATABASE_URL", "")
+    if not url:
+        return {"ok": False, "error": "DATABASE_URL missing"}
+    try:
+        # short connect timeout to avoid long hangs
+        conn = psycopg.connect(url, connect_timeout=5)
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute("select 1;")
+                row = cur.fetchone()
+        return {"ok": row == (1,), "database_url": _mask_url(url)}
+    except Exception as e:
+        return {"ok": False, "database_url": _mask_url(url), "error": str(e)}
+
 # ---------- include routers ----------
 app.include_router(contacts_router)
 app.include_router(org_router)
