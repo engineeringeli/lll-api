@@ -74,6 +74,7 @@ def health_env():
         "DATABASE_URL",
         "REDIS_URL",
         "INLINE_APPROVE_SEND",
+        "DISABLE_QUEUE",
         "ALLOW_LOCALHOST",
         "PORTAL_BASE",
         "UPLOADS_BUCKET",
@@ -92,7 +93,6 @@ def health_redis():
     try:
         r = redis.from_url(url, decode_responses=True)
         ok = r.ping()
-        # show basic rq info if present
         q_key = "rq:queue:outbound"
         q_len = r.llen(q_key) if r.exists(q_key) else 0
         workers = r.smembers("rq:workers") if r.exists("rq:workers") else set()
@@ -111,7 +111,6 @@ def health_db():
     if not url:
         return {"ok": False, "error": "DATABASE_URL missing"}
     try:
-        # short connect timeout to avoid long hangs
         conn = psycopg.connect(url, connect_timeout=5)
         with conn:
             with conn.cursor() as cur:
