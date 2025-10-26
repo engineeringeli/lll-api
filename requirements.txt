@@ -1,6 +1,7 @@
 fastapi==0.115.0
 uvicorn[standard]==0.30.6
 psycopg[binary]==3.1.18
+psycopg-pool 
 redis==5.0.8
 rq==1.15.1
 requests>=2.31
