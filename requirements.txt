@@ -1,7 +1,7 @@
 openai==1.51.0
 fastapi
 uvicorn[standard]
-
-fastapi
-uvicorn[standard]
 psycopg[binary]==3.1.18
+redis>=5.0
+rq>=1.15           # only if you enqueue jobs with RQ (you do in main.py)
+
