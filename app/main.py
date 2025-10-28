@@ -13,8 +13,6 @@ from app.routes_docs import router as docs_router
 from app.routes_contacts import router as contacts_router
 # backend/app/main.py (or wherever you include routers)
 from app.routes_debug import router as debug_router
-app.include_router(debug_router)
-
 
 # prefer absolute import; fall back to relative if needed
 try:
@@ -25,6 +23,7 @@ except ModuleNotFoundError:
 import os
 
 app = FastAPI(title="Lawyer Follow-up API")
+
 
 # --- CORS ---
 # Matches:
@@ -125,6 +124,7 @@ def health_db():
         return {"ok": False, "database_url": _mask_url(url), "error": str(e)}
 
 # ---------- include routers ----------
+app.include_router(debug_router)
 app.include_router(contacts_router)
 app.include_router(org_router)
 app.include_router(msgs_router)
