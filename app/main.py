@@ -11,6 +11,10 @@ from app.routes_webhooks import router as webhooks_router
 from app.routes_leads import router as leads_router
 from app.routes_docs import router as docs_router
 from app.routes_contacts import router as contacts_router
+# backend/app/main.py (or wherever you include routers)
+from app.routes_debug import router as debug_router
+app.include_router(debug_router)
+
 
 # prefer absolute import; fall back to relative if needed
 try:
