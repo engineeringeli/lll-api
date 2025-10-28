@@ -22,6 +22,9 @@ from psycopg.types.json import Json
 from dotenv import load_dotenv
 load_dotenv(override=True)
 
+# --- Queue plumbing (single source of truth) ---
+from app.queue import get_queue, QUEUE_NAME
+
 # ============================================================
 # ENV / CONFIG
 # ============================================================
@@ -77,7 +80,7 @@ def _db():
         yield conn
 
 def _get_queue():
-    from app.queue import get_queue
+    # kept for minimal call-site changes; uses shared QUEUE_NAME internally
     return get_queue()
 
 # ============================================================
@@ -512,12 +515,14 @@ def on_client_upload(contact_id: str, requirement_id: str | None = None) -> dict
         if when and when > now_utc:
             try:
                 from rq.scheduler import Scheduler
-                scheduler = Scheduler("outbound", connection=q.connection)
+                scheduler = Scheduler(QUEUE_NAME, connection=q.connection)
+                print(f"[scheduler] enqueue_at queue={QUEUE_NAME} message_id={draft_id} when={when.isoformat()}")
                 scheduler.enqueue_at(when, "app.jobs.send_message_and_update", draft_id, "EMAIL")
                 return {"ok": True, "draft_id": draft_id, "auto_enqueued": True, "scheduled_for": when.isoformat()}
             except Exception:
                 pass
 
+        print(f"[queue] enqueue send_message_and_update id={draft_id} q={QUEUE_NAME}")
         q.enqueue("app.jobs.send_message_and_update", draft_id, "EMAIL")
         return {"ok": True, "draft_id": draft_id, "auto_enqueued": True}
 
@@ -751,12 +756,14 @@ def on_all_docs_received(contact_id: str) -> dict:
         if when and when > now_utc:
             try:
                 from rq.scheduler import Scheduler
-                scheduler = Scheduler("outbound", connection=q.connection)
+                scheduler = Scheduler(QUEUE_NAME, connection=q.connection)
+                print(f"[scheduler] enqueue_at queue={QUEUE_NAME} message_id={draft_id} when={when.isoformat()}")
                 scheduler.enqueue_at(when, "app.jobs.send_message_and_update", draft_id, "EMAIL")
                 return {"ok": True, "draft_id": draft_id, "auto_enqueued": True, "scheduled_for": when.isoformat()}
             except Exception:
                 pass
 
+        print(f"[queue] enqueue send_message_and_update id={draft_id} q={QUEUE_NAME}")
         q.enqueue("app.jobs.send_message_and_update", draft_id, "EMAIL")
         return {"ok": True, "draft_id": draft_id, "auto_enqueued": True}
 
@@ -881,11 +888,14 @@ def react_to_inbound(message_id: str):
             if when and when > now_utc:
                 try:
                     from rq.scheduler import Scheduler
-                    scheduler = Scheduler("outbound", connection=q.connection)
+                    scheduler = Scheduler(QUEUE_NAME, connection=q.connection)
+                    print(f"[scheduler] enqueue_at queue={QUEUE_NAME} message_id={draft_id} when={when.isoformat()}")
                     scheduler.enqueue_at(when, "app.jobs.send_message_and_update", draft_id, "EMAIL")
                 except Exception:
+                    print(f"[queue] enqueue (fallback) send_message_and_update id={draft_id} q={QUEUE_NAME}")
                     q.enqueue("app.jobs.send_message_and_update", draft_id, "EMAIL")
             else:
+                print(f"[queue] enqueue send_message_and_update id={draft_id} q={QUEUE_NAME}")
                 q.enqueue("app.jobs.send_message_and_update", draft_id, "EMAIL")
         except Exception:
             # if queue fails, leave as draft
