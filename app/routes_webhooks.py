@@ -3,7 +3,7 @@ from fastapi import APIRouter, Request, HTTPException, Depends, Form
 from fastapi.responses import JSONResponse
 from psycopg import Connection
 from psycopg.types.json import Json
-from app.deps import get_db
+from app.deps import db_conn
 from app.queue import get_queue
 
 from urllib.parse import parse_qs
@@ -175,7 +175,7 @@ def _extract_plain_text_from_form(form) -> str | None:
 # Twilio SMS inbound
 # -------------------------------------------------
 @router.post("/twilio/sms")
-async def twilio_sms(request: Request, db: Connection = Depends(get_db)):
+async def twilio_sms(request: Request, db: Connection = Depends(db_conn)):
     try:
         raw_bytes = await request.body()
         raw_text = raw_bytes.decode("utf-8", errors="replace")
@@ -236,7 +236,7 @@ async def twilio_sms(request: Request, db: Connection = Depends(get_db)):
 # -------------------------------------------------
 @router.post("/dev/email")
 async def dev_email(
-    db: Connection = Depends(get_db),
+    db: Connection = Depends(db_conn),
     to_email: str = Form(...),
     from_email: str = Form(...),
     body: str = Form("")
@@ -279,7 +279,7 @@ async def dev_email(
 # SendGrid Inbound Parse webhook (robust body extraction)
 # -------------------------------------------------
 @router.post("/sendgrid/inbound")
-async def sendgrid_inbound(request: Request, db: Connection = Depends(get_db)):
+async def sendgrid_inbound(request: Request, db: Connection = Depends(db_conn)):
     # Starlette parses multipart into FormData with strings and/or UploadFile objects
     form = await request.form()
 
