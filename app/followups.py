@@ -148,17 +148,6 @@ def _normalize(text: str) -> str:
     text = re.sub(r"\[[^\]]+\]", "", text)
     return text.strip()
 
-def _append_signature_once(body: str, org: dict) -> str:
-    """Append the configured signature exactly once at the end of the body."""
-    sig = (org.get("include_signature") and (org.get("outbound_signature") or "").strip()) or ""
-    b = (body or "").strip()
-    if not sig:
-        return b
-    # if the body already ends with the exact signature, don't add it again
-    if b.endswith(sig):
-        return b
-    return f"{b}\n\n{sig}".strip()
-
 def _first_name(contact: Dict[str, Any]) -> str:
     return (contact.get("first_name") or "").strip()
 
