@@ -2,7 +2,7 @@
 from fastapi import APIRouter, Depends, HTTPException, Body
 from psycopg import Connection
 from psycopg.types.json import Json
-from app.deps import db_conn
+from app.deps import get_db
 from app.models import OrgSettingsOut, OrgSettingsUpdate
 
 router = APIRouter(prefix="/org", tags=["org"])
@@ -27,7 +27,7 @@ EXTRA_FIELDS = [
 ALL_FIELDS = BASE_FIELDS + EXTRA_FIELDS
 
 @router.get("/settings")
-def get_settings(db: Connection = Depends(db_conn)):
+def get_settings(db: Connection = Depends(get_db)):
     row = db.execute("SELECT * FROM org_settings LIMIT 1;").fetchone()
     if not row:
         raise HTTPException(500, "org_settings row not found")
@@ -38,7 +38,7 @@ def get_settings(db: Connection = Depends(db_conn)):
     return {k: out.get(k) for k in ALL_FIELDS}
 
 @router.api_route("/settings", methods=["PUT","POST"])
-def update_settings(payload: dict = Body(...), db: Connection = Depends(db_conn)):
+def update_settings(payload: dict = Body(...), db: Connection = Depends(get_db)):
     sets, vals = [], []
     for k in ALL_FIELDS:
         if k in payload and payload[k] is not None:
