@@ -129,7 +129,7 @@ def _borrow():
     assert last_err is not None
     raise last_err
 
-def db_conn() -> Iterator:
+def get_db() -> Iterator:
     with _borrow() as conn:
         yield conn
 
