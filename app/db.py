@@ -1,53 +1,105 @@
 # backend/app/db.py
-import os, time
-from contextlib import asynccontextmanager
-import psycopg
-from psycopg.rows import dict_row
+from __future__ import annotations
+
+import os
+from contextlib import asynccontextmanager, contextmanager
+from typing import Iterator
+
 from psycopg_pool import ConnectionPool
+from psycopg import Connection
+from urllib.parse import urlsplit, urlunsplit, urlencode, parse_qsl
 
-DATABASE_URL = os.getenv("DATABASE_URL")
-if not DATABASE_URL:
-    raise RuntimeError("DATABASE_URL missing")
+# ---------- env ----------
+DATABASE_URL = os.getenv("DATABASE_URL", "")
 
-# Hardened conninfo (add ssl + keepalives + sane timeouts)
-def augment(url: str) -> str:
-    from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
+DB_POOL_MAX_SIZE = int(os.getenv("DB_POOL_MAX_SIZE", "10"))     # total conns
+DB_POOL_MIN_SIZE = int(os.getenv("DB_POOL_MIN_SIZE", "1"))
+DB_POOL_MAX_WAIT = float(os.getenv("DB_POOL_MAX_WAIT", "5"))    # seconds to wait for a conn
+DB_OP_TIMEOUT    = float(os.getenv("DB_OP_TIMEOUT", "10"))      # per-connection statement_timeout (seconds)
+
+# ---------- helpers ----------
+def _augment_conninfo(url: str) -> str:
+    """
+    Ensure useful defaults on the connection string, without clobbering explicit values.
+    Adds: sslmode=require (if missing), connect_timeout, keepalives, statement_timeout.
+    """
+    if not url:
+        raise RuntimeError("DATABASE_URL missing")
+
     p = urlsplit(url)
+    # Parse existing query params into a dict
     q = dict(parse_qsl(p.query, keep_blank_values=True))
-    q.setdefault("sslmode", "require")
-    q.setdefault("connect_timeout", "10")
+
+    # Only set defaults if absent
+    q.setdefault("sslmode", "require")                    # Render/Supabase prod best practice
+    q.setdefault("connect_timeout", "5")                  # seconds
     q.setdefault("keepalives", "1")
     q.setdefault("keepalives_idle", "30")
     q.setdefault("keepalives_interval", "10")
     q.setdefault("keepalives_count", "5")
-    return urlunsplit((p.scheme, p.netloc, p.path, urlencode(q.items()), p.fragment))
 
-CONNINFO = augment(DATABASE_URL)
+    # Apply a server-side statement timeout (milliseconds)
+    # (Many Postgres providers honor 'options' with -c key=val)
+    stmt_ms = str(int(DB_OP_TIMEOUT * 1000))
+    options = q.get("options", "")
+    if f"statement_timeout={stmt_ms}" not in options:
+        extra = f"-c statement_timeout={stmt_ms}"
+        options = f"{options} {extra}".strip() if options else extra
+        q["options"] = options
 
-# Tune these by env so you can tweak without redeploying
-POOL_MAX_SIZE = int(os.getenv("DB_POOL_MAX_SIZE", "10"))       # try 10–20 per API pod
-POOL_MAX_WAIT = float(os.getenv("DB_POOL_MAX_WAIT", "5"))      # seconds to wait before timeout (fail fast)
-POOL_TIMEOUT  = float(os.getenv("DB_OP_TIMEOUT", "25"))        # statement_timeout-ish at app layer
+    # Rebuild query string correctly (BUGFIX: pass a mapping, not dict_items)
+    new_query = urlencode(q, doseq=True)
+    return urlunsplit((p.scheme, p.netloc, p.path, new_query, p.fragment))
 
-pool = ConnectionPool(
-    conninfo=CONNINFO,
-    max_size=POOL_MAX_SIZE,
-    max_wait=POOL_MAX_WAIT,
-    kwargs={"autocommit": False, "row_factory": dict_row},
-)
 
-# FastAPI lifecycle hooks (import this module in your app __init__)
-def open_pool():
-    pool.open()
+# Global pool (created on startup)
+pool: ConnectionPool | None = None
 
-def close_pool():
-    pool.close()
 
-@asynccontextmanager
-async def db_conn():
-    # Fail fast if all connections are busy
-    with pool.connection(timeout=POOL_MAX_WAIT) as conn:
-        with conn.cursor() as cur:
-            # Optional: enforce statement_timeout per session (server-side)
-            cur.execute("SET LOCAL statement_timeout = %s;", (int(POOL_TIMEOUT * 1000),))
-        yield conn
+def open_pool() -> None:
+    """Create the global pool once per process."""
+    global pool
+    if pool is not None:
+        return
+    conninfo = _augment_conninfo(DATABASE_URL)
+    # psycopg_pool uses 'max_size', 'min_size', and 'timeout' to wait for a connection
+    pool = ConnectionPool(
+        conninfo,
+        max_size=DB_POOL_MAX_SIZE,
+        min_size=DB_POOL_MIN_SIZE,
+        timeout=DB_POOL_MAX_WAIT,   # how long to wait for a free connection
+        max_idle=30,                # seconds to keep idle conns before recycling
+        kwargs={"autocommit": False},  # we manage transactions explicitly
+    )
+
+
+def close_pool() -> None:
+    """Close the global pool gracefully."""
+    global pool
+    if pool is not None:
+        try:
+            pool.close()
+        finally:
+            pool = None
+
+
+@contextmanager
+def db_conn() -> Iterator[Connection]:
+    """
+    FastAPI dependency: yields a pooled psycopg Connection.
+    Commits on success, rolls back on exception.
+    Times out quickly if the pool is exhausted (DB_POOL_MAX_WAIT).
+    """
+    if pool is None:
+        # Fallback: open the pool lazily if startup hook didn't run yet
+        open_pool()
+    assert pool is not None, "DB pool not initialized"
+
+    # timeout here is how long to wait for a connection from the pool
+    with pool.connection(timeout=DB_POOL_MAX_WAIT) as conn:
+        try:
+            yield conn
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
