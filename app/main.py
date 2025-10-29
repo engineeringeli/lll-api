@@ -1,4 +1,3 @@
-# backend/app/main.py
 from __future__ import annotations
 
 import os
@@ -98,8 +97,11 @@ def health_env():
         "PORTAL_BASE",
         "UPLOADS_BUCKET",
         "DB_POOL_MAX_SIZE",
+        "DB_POOL_MIN_SIZE",
         "DB_POOL_MAX_WAIT",
         "DB_OP_TIMEOUT",
+        "DB_BORROW_RETRIES",
+        "DB_BORROW_SLEEP",
     ]
     out: dict[str, Any] = {}
     for k in keys:
@@ -133,7 +135,7 @@ def health_db():
         if pool is None:
             open_pool()
         assert pool is not None
-        with pool.connection(timeout=float(os.getenv("DB_POOL_MAX_WAIT", "5"))) as conn:
+        with pool.connection(timeout=float(os.getenv("DB_POOL_MAX_WAIT", "15"))) as conn:
             with conn.cursor() as cur:
                 cur.execute("SELECT 1;")
                 row = cur.fetchone()
