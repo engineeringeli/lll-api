@@ -10,7 +10,6 @@ from app.decisions import should_autosend
 from app.followups import _portal_url as build_portal_url
 
 import os, json, time, requests, secrets
-from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
 from uuid import uuid4, UUID
 from typing import Optional, Dict, Any, List
 from datetime import datetime, timedelta, timezone, date
@@ -19,13 +18,9 @@ from contextlib import contextmanager
 import psycopg
 from psycopg.rows import dict_row
 from psycopg.types.json import Json
-from psycopg.errors import OperationalError
 
 from dotenv import load_dotenv
 load_dotenv(override=True)
-
-# --- Queue plumbing (single source of truth) ---
-from app.queue import get_queue, QUEUE_NAME
 
 # ============================================================
 # ENV / CONFIG
@@ -33,35 +28,6 @@ from app.queue import get_queue, QUEUE_NAME
 DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL missing in backend/.env")
-
-def _augment_conninfo(url: str) -> str:
-    """
-    Harden conn string for hosted Postgres:
-      - sslmode=require (unless already present)
-      - connect_timeout
-      - TCP keepalives
-    """
-    if not url:
-        return url
-    parts = urlsplit(url)
-    q_pairs = parse_qsl(parts.query, keep_blank_values=True)
-    # keep original order, but track lower-case presence
-    existing_lc = {k.lower() for k, _ in q_pairs}
-    def add_if_absent(k, v):
-        if k.lower() not in existing_lc:
-            q_pairs.append((k, v))
-
-    add_if_absent("sslmode", "require")
-    add_if_absent("connect_timeout", "10")
-    add_if_absent("keepalives", "1")
-    add_if_absent("keepalives_idle", "30")
-    add_if_absent("keepalives_interval", "10")
-    add_if_absent("keepalives_count", "5")
-
-    new_query = urlencode(q_pairs)
-    return urlunsplit((parts.scheme, parts.netloc, parts.path, new_query, parts.fragment))
-
-CONNINFO = _augment_conninfo(DATABASE_URL)
 
 # If true, skip actual provider sends (helpful for demos)
 DEMO_SEND = os.getenv("DEMO_SEND", "false").lower() in ("1", "true", "yes", "on")
@@ -103,25 +69,15 @@ def _json_dumps(obj):
     return json.dumps(obj, default=_default)
 
 # ============================================================
-# DB helper (with retry + hardened conninfo)
+# DB helper
 # ============================================================
 @contextmanager
 def _db():
-    last_err = None
-    for attempt in range(3):
-        try:
-            with psycopg.connect(CONNINFO, row_factory=dict_row, autocommit=False) as conn:
-                yield conn
-            return
-        except OperationalError as e:
-            last_err = e
-            # brief backoff for transient handshake/SSL drops
-            time.sleep(0.3 + 0.2 * attempt)
-    # if all retries fail, raise the last error
-    raise last_err
+    with psycopg.connect(DATABASE_URL, row_factory=dict_row, autocommit=False) as conn:
+        yield conn
 
 def _get_queue():
-    # kept for minimal call-site changes; uses shared QUEUE_NAME internally
+    from app.queue import get_queue
     return get_queue()
 
 # ============================================================
@@ -236,7 +192,7 @@ def send_email(
         "status": r.status_code,
         "text": r.text,
         "reply_to": reply_to_email,
-        "message_id": personalization_headers.get("Message-ID"),  # echo back what we set (threading id)
+        "message_id": personalization_headers.get("Message-ID"),  # echo back what we set
     }
 
 def send_sms(to_number: str, body_text: str) -> Dict[str, Any]:
@@ -556,14 +512,12 @@ def on_client_upload(contact_id: str, requirement_id: str | None = None) -> dict
         if when and when > now_utc:
             try:
                 from rq.scheduler import Scheduler
-                scheduler = Scheduler(QUEUE_NAME, connection=q.connection)
-                print(f"[scheduler] enqueue_at queue={QUEUE_NAME} message_id={draft_id} when={when.isoformat()}")
+                scheduler = Scheduler("outbound", connection=q.connection)
                 scheduler.enqueue_at(when, "app.jobs.send_message_and_update", draft_id, "EMAIL")
                 return {"ok": True, "draft_id": draft_id, "auto_enqueued": True, "scheduled_for": when.isoformat()}
             except Exception:
                 pass
 
-        print(f"[queue] enqueue send_message_and_update id={draft_id} q={QUEUE_NAME}")
         q.enqueue("app.jobs.send_message_and_update", draft_id, "EMAIL")
         return {"ok": True, "draft_id": draft_id, "auto_enqueued": True}
 
@@ -797,14 +751,12 @@ def on_all_docs_received(contact_id: str) -> dict:
         if when and when > now_utc:
             try:
                 from rq.scheduler import Scheduler
-                scheduler = Scheduler(QUEUE_NAME, connection=q.connection)
-                print(f"[scheduler] enqueue_at queue={QUEUE_NAME} message_id={draft_id} when={when.isoformat()}")
+                scheduler = Scheduler("outbound", connection=q.connection)
                 scheduler.enqueue_at(when, "app.jobs.send_message_and_update", draft_id, "EMAIL")
                 return {"ok": True, "draft_id": draft_id, "auto_enqueued": True, "scheduled_for": when.isoformat()}
             except Exception:
                 pass
 
-        print(f"[queue] enqueue send_message_and_update id={draft_id} q={QUEUE_NAME}")
         q.enqueue("app.jobs.send_message_and_update", draft_id, "EMAIL")
         return {"ok": True, "draft_id": draft_id, "auto_enqueued": True}
 
@@ -929,14 +881,11 @@ def react_to_inbound(message_id: str):
             if when and when > now_utc:
                 try:
                     from rq.scheduler import Scheduler
-                    scheduler = Scheduler(QUEUE_NAME, connection=q.connection)
-                    print(f"[scheduler] enqueue_at queue={QUEUE_NAME} message_id={draft_id} when={when.isoformat()}")
+                    scheduler = Scheduler("outbound", connection=q.connection)
                     scheduler.enqueue_at(when, "app.jobs.send_message_and_update", draft_id, "EMAIL")
                 except Exception:
-                    print(f"[queue] enqueue (fallback) send_message_and_update id={draft_id} q={QUEUE_NAME}")
                     q.enqueue("app.jobs.send_message_and_update", draft_id, "EMAIL")
             else:
-                print(f"[queue] enqueue send_message_and_update id={draft_id} q={QUEUE_NAME}")
                 q.enqueue("app.jobs.send_message_and_update", draft_id, "EMAIL")
         except Exception:
             # if queue fails, leave as draft
