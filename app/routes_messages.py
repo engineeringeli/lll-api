@@ -12,7 +12,7 @@ from fastapi import APIRouter, Depends, HTTPException, Body, Query
 from psycopg import Connection
 from psycopg.types.json import Json
 
-from app.deps import get_db
+from app.deps import db_conn
 from app.decisions import should_autosend
 from app.followups import generate_initial_docs_request, _portal_url as build_portal_url
 from app.queue import get_queue
@@ -155,7 +155,7 @@ def _draft_initial_docs_request(contact_id: str, db: Connection) -> dict:
 # -----------------------------
 
 @router.get("/thread/{contact_id}")
-def get_thread(contact_id: str, db: Connection = Depends(get_db)):
+def get_thread(contact_id: str, db: Connection = Depends(db_conn)):
     contact = _contact(db, contact_id)
     msgs = db.execute(
         """
@@ -174,7 +174,7 @@ def get_thread(contact_id: str, db: Connection = Depends(get_db)):
 @router.get("/thread/by-message/{message_id}")
 def thread_by_message(
     message_id: str,
-    db: Connection = Depends(get_db),
+    db: Connection = Depends(db_conn),
     fallback_contact_id: Optional[str] = Query(default=None),
 ):
     rec = db.execute(
@@ -238,7 +238,7 @@ def thread_by_message(
 # -----------------------------
 
 @router.post("/draft-initial-docs/{contact_id}")
-def draft_initial_docs_route(contact_id: str, db: Connection = Depends(get_db)):
+def draft_initial_docs_route(contact_id: str, db: Connection = Depends(db_conn)):
     """
     Compose a docs-specific initial draft email (lists required docs + portal link).
     """
@@ -246,7 +246,7 @@ def draft_initial_docs_route(contact_id: str, db: Connection = Depends(get_db)):
 
 
 @router.post("/draft-initial/{contact_id}")
-def draft_initial(contact_id: str, payload: dict = Body(default={}), db: Connection = Depends(get_db)):
+def draft_initial(contact_id: str, payload: dict = Body(default={}), db: Connection = Depends(db_conn)):
     """
     Compose initial draft and (optionally) auto-send if org rules allow.
     """
@@ -320,7 +320,7 @@ def draft_initial(contact_id: str, payload: dict = Body(default={}), db: Connect
 # -----------------------------
 
 @router.post("/draft-update/{message_id}")
-def update_draft_post(message_id: str, payload: dict = Body(...), db: Connection = Depends(get_db)):
+def update_draft_post(message_id: str, payload: dict = Body(...), db: Connection = Depends(db_conn)):
     new_body = (payload.get("body") or "").strip()
     if not new_body:
         raise HTTPException(422, "body is required")
@@ -347,7 +347,7 @@ def update_draft_post(message_id: str, payload: dict = Body(...), db: Connection
 # -----------------------------
 
 @router.post("/approve/{message_id}")
-def approve_and_send(message_id: str, db: Connection = Depends(get_db)):
+def approve_and_send(message_id: str, db: Connection = Depends(db_conn)):
     """
     Approve a DRAFT and send.
     Prefer enqueue to RQ; if enqueue fails and INLINE_APPROVE_SEND is on, try inline send.
