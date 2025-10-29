@@ -1,24 +1,22 @@
 # backend/app/routes_docs.py
-from __future__ import annotations
-
-from datetime import datetime, timezone, timedelta, date
-from typing import Optional
-from uuid import UUID
-import hashlib
-import json
-import os
-import secrets
-import time
 
 from fastapi import APIRouter, Depends, HTTPException, Body, Query
 from fastapi.responses import JSONResponse
 from psycopg import Connection
 from psycopg.types.json import Json
+from datetime import datetime, timezone, timedelta, date
+from uuid import UUID
 
-from app.deps import db_conn
-from app.queue import get_queue
-from app.decisions import should_autosend
+import os
+import secrets
+import hashlib
+import time
+import json
+
 from app.followups import generate_initial_docs_request, _portal_url as build_portal_url
+from app.deps import get_db
+from app.decisions import should_autosend
+from app.queue import get_queue
 
 router = APIRouter(prefix="/docs", tags=["docs"])
 
@@ -26,18 +24,14 @@ router = APIRouter(prefix="/docs", tags=["docs"])
 # Config / helpers
 # ---------------------------------------------------------------------
 
-BUCKET = (
-    os.getenv("UPLOADS_BUCKET")
-    or os.getenv("SUPABASE_BUCKET")
-    or "uploads"
-)
+BUCKET = os.getenv("UPLOADS_BUCKET") or os.getenv("SUPABASE_BUCKET") or "uploads"
 
 def _json500(detail: str):
     """Uniform JSON 500 so frontends never try to parse HTML."""
     return JSONResponse(status_code=500, content={"detail": detail})
 
 def _json_dumps(obj):
-    """Safe JSON dumper for psycopg Json(...)."""
+    """Safe JSON dumper for psycopg Json(...), handling UUID/datetime/set."""
     def _default(o):
         if isinstance(o, (datetime, date)):
             return o.isoformat()
@@ -48,50 +42,35 @@ def _json_dumps(obj):
         return str(o)
     return json.dumps(obj, default=_default)
 
-def _table_exists(db: Connection, name: str) -> bool:
+def _get_contact(db: Connection, contact_id: str):
     row = db.execute(
-        """
-        select exists(
-          select 1
-            from information_schema.tables
-           where table_schema='public'
-             and table_name=%s
-        ) as ok;
-        """,
-        (name,),
+        "select id, first_name, last_name, email, phone, matter_type, dnc, last_sent_at, sends_today "
+        "from contacts where id=%s;",
+        (contact_id,),
     ).fetchone()
-    return bool(row and row["ok"])
+    return dict(row) if row else None
 
 def _contact_exists(db: Connection, contact_id: str) -> bool:
     row = db.execute("select 1 from contacts where id=%s;", (contact_id,)).fetchone()
     return bool(row)
 
-def _get_contact(db: Connection, contact_id: str) -> Optional[dict]:
-    row = db.execute(
-        """
-        select id, first_name, last_name, email, phone, matter_type,
-               dnc, last_sent_at, sends_today
-          from contacts
-         where id=%s;
-        """,
-        (contact_id,),
-    ).fetchone()
-    return dict(row) if row else None
-
 def _short_code(label: str) -> str:
-    """Short code without pgcrypto, stable enough for display."""
+    """Short deterministic-ish code without requiring pgcrypto."""
     seed = f"{label}|{time.time_ns()}"
     return hashlib.md5(seed.encode("utf-8")).hexdigest()[:12]
 
+def _table_exists(db: Connection, name: str) -> bool:
+    row = db.execute("""
+        select exists(
+          select 1 from information_schema.tables
+          where table_schema='public' and table_name=%s
+        ) as ok;
+    """, (name,)).fetchone()
+    return bool(row["ok"])
+
 def _ensure_portal_token(db: Connection, contact_id: str, *, ttl_days: int = 30) -> str:
     tok = db.execute(
-        """
-        select token
-          from portal_tokens
-         where contact_id=%s
-           and (expires_at is null or expires_at > now())
-         limit 1;
-        """,
+        "SELECT token FROM portal_tokens WHERE contact_id=%s AND (expires_at IS NULL OR expires_at>now()) LIMIT 1;",
         (contact_id,),
     ).fetchone()
     if tok:
@@ -99,18 +78,18 @@ def _ensure_portal_token(db: Connection, contact_id: str, *, ttl_days: int = 30)
     token = secrets.token_urlsafe(24)
     exp = datetime.now(timezone.utc) + timedelta(days=ttl_days)
     db.execute(
-        "insert into portal_tokens(token, contact_id, expires_at) values (%s,%s,%s);",
+        "INSERT INTO portal_tokens(token, contact_id, expires_at) VALUES (%s,%s,%s);",
         (token, contact_id, exp),
     )
     return token
 
 def _portal_url(db: Connection, contact_id: str) -> str:
-    base = os.getenv("PORTAL_BASE", "http://localhost:3000").rstrip("/")
+    base = os.getenv("PORTAL_BASE", "http://localhost:3000")
     token = _ensure_portal_token(db, contact_id, ttl_days=30)
     return f"{base}/portal/{token}"
 
-def _org_settings(db: Connection) -> dict:
-    row = db.execute("select * from org_settings limit 1;").fetchone()
+def _org_settings(db: Connection):
+    row = db.execute("SELECT * FROM org_settings LIMIT 1;").fetchone()
     if not row:
         return {
             "require_approval_initial": True,
@@ -123,25 +102,28 @@ def _org_settings(db: Connection) -> dict:
             "grace_minutes": 5,
             "outbound_from_name": os.getenv("SENDER_NAME", "Law Firm"),
             "include_signature": False,
-            "outbound_signature": "",
+            "signature": "",
         }
-    d = dict(row)
-    d.setdefault("outbound_from_name", os.getenv("SENDER_NAME", "Law Firm"))
-    d.setdefault("include_signature", False)
-    d.setdefault("outbound_signature", "")
-    return d
+    row = dict(row)
+    row.setdefault("outbound_from_name", os.getenv("SENDER_NAME", "Law Firm"))
+    row.setdefault("include_signature", False)
+    row.setdefault("signature", "")
+    return row
 
 def _latest_provider_msgid_and_subject(db: Connection, contact_id: str):
+    """
+    Return most recent provider_message_id and subject for this contact, if any.
+    """
     return db.execute(
         """
-        select
-          meta->>'provider_message_id' as pmid,
-          coalesce(meta->>'subject', meta->>'subject_used') as subj
-          from messages
-         where contact_id = %s
-           and (meta->>'provider_message_id') is not null
-         order by created_at desc
-         limit 1;
+        SELECT
+          meta->>'provider_message_id' AS pmid,
+          COALESCE(meta->>'subject', meta->>'subject_used') AS subj
+        FROM messages
+        WHERE contact_id = %s
+          AND (meta->>'provider_message_id') IS NOT NULL
+        ORDER BY created_at DESC
+        LIMIT 1;
         """,
         (contact_id,),
     ).fetchone()
@@ -149,12 +131,12 @@ def _latest_provider_msgid_and_subject(db: Connection, contact_id: str):
 def _all_required_pending_count(db: Connection, contact_id: str) -> int:
     rec = db.execute(
         """
-        select count(*) as n
-          from client_documents cd
-          join document_requirements dr on dr.id = cd.requirement_id
-         where cd.contact_id = %s
-           and coalesce(cd.is_required, dr.is_required) = true
-           and cd.status = 'PENDING';
+        SELECT COUNT(*) AS n
+          FROM client_documents cd
+          JOIN document_requirements dr ON dr.id = cd.requirement_id
+         WHERE cd.contact_id = %s
+           AND COALESCE(cd.is_required, dr.is_required) = TRUE
+           AND cd.status = 'PENDING';
         """,
         (contact_id,),
     ).fetchone()
@@ -165,7 +147,7 @@ def _all_required_pending_count(db: Connection, contact_id: str) -> int:
 # ---------------------------------------------------------------------
 
 @router.get("/checklist/{contact_id}")
-def checklist(contact_id: str, db: Connection = Depends(db_conn)):
+def checklist(contact_id: str, db: Connection = Depends(get_db)):
     if not _contact_exists(db, contact_id):
         raise HTTPException(404, "contact not found")
 
@@ -183,10 +165,10 @@ def checklist(contact_id: str, db: Connection = Depends(db_conn)):
                cd.reviewed_at,
                cd.source,
                cd.created_by
-          from client_documents cd
-          join document_requirements dr on dr.id = cd.requirement_id
-         where cd.contact_id = %s
-         order by dr.label asc;
+        from client_documents cd
+        join document_requirements dr on dr.id = cd.requirement_id
+        where cd.contact_id = %s
+        order by dr.label asc;
         """,
         (contact_id,),
     ).fetchall()
@@ -194,9 +176,9 @@ def checklist(contact_id: str, db: Connection = Depends(db_conn)):
     files = db.execute(
         """
         select id, requirement_id, storage_bucket, storage_path, bytes, mime_type, created_at
-          from files
-         where contact_id = %s
-         order by created_at desc;
+        from files
+        where contact_id = %s
+        order by created_at desc;
         """,
         (contact_id,),
     ).fetchall()
@@ -207,7 +189,7 @@ def checklist(contact_id: str, db: Connection = Depends(db_conn)):
 def add_custom_requirement(
     contact_id: str,
     payload: dict = Body(...),
-    db: Connection = Depends(db_conn),
+    db: Connection = Depends(get_db),
 ):
     if not _contact_exists(db, contact_id):
         raise HTTPException(404, "contact not found")
@@ -245,7 +227,7 @@ def add_custom_requirement(
 def bulk_add_requirements(
     contact_id: str,
     payload: dict = Body(...),
-    db: Connection = Depends(db_conn),
+    db: Connection = Depends(get_db),
 ):
     if not _contact_exists(db, contact_id):
         raise HTTPException(404, "contact not found")
@@ -286,66 +268,69 @@ def bulk_add_requirements(
 # ---------------------------------------------------------------------
 
 @router.post("/kickoff/{contact_id}")
-def kickoff_docs_request(contact_id: str, db: Connection = Depends(db_conn)):
+def kickoff_docs_request(contact_id: str, db: Connection = Depends(get_db)):
+    # 1) contact
     c = _get_contact(db, contact_id)
     if not c:
         raise HTTPException(status_code=404, detail="Contact not found")
     if c.get("dnc"):
         raise HTTPException(status_code=400, detail="Contact is DNC")
 
-    # required + pending labels
+    # 2) gather required + pending labels
     missing_rows = db.execute(
         """
-        select dr.label
-          from client_documents cd
-          join document_requirements dr on dr.id = cd.requirement_id
-         where cd.contact_id = %s
-           and coalesce(cd.is_required, dr.is_required) = true
-           and cd.status = 'PENDING'
-         order by dr.label;
+        SELECT dr.label
+          FROM client_documents cd
+          JOIN document_requirements dr ON dr.id = cd.requirement_id
+         WHERE cd.contact_id = %s
+           AND COALESCE(cd.is_required, dr.is_required) = TRUE
+           AND cd.status = 'PENDING'
+         ORDER BY dr.label;
         """,
         (contact_id,),
     ).fetchall()
     missing_labels = [r["label"] for r in missing_rows]
 
-    # portal + org
+    # 3) portal + org
     portal = build_portal_url(db, contact_id, os.getenv("PORTAL_BASE", "http://localhost:3000"))
     org = _org_settings(db)
 
-    # draft content
+    # 4) AI-generate a context-specific initial docs request
     gen = generate_initial_docs_request(db, c, missing_labels, portal, org)
-    subject = gen.get("subject") or "Document Request"
-    body = gen.get("body") or ""
+    body = gen["body"]
+    subject = gen["subject"]  # keep as-is for the initial
 
+    # Thread with last provider message if one exists (initial may still be reply)
     prev = _latest_provider_msgid_and_subject(db, contact_id)
     reply_to = (prev and prev["pmid"]) or None
 
     meta = {
         "intent": gen.get("intent", "initial_docs_request"),
-        "confidence": float(gen.get("confidence", 0.92)),
+        "confidence": gen.get("confidence", 0.92),
         "labels": missing_labels,
         "portal": portal,
         "subject": subject,
-        "reply_to_message_id": reply_to,
+        "reply_to_message_id": reply_to,   # threading hint for worker
         "_llm": gen.get("_llm"),
     }
 
+    # 5) persist the draft
     draft_row = db.execute(
         """
-        insert into messages(contact_id, channel, direction, body, meta)
-        values (%s, 'EMAIL', 'DRAFT', %s, %s)
-        returning id;
+        INSERT INTO messages(contact_id, channel, direction, body, meta)
+        VALUES (%s,'EMAIL','DRAFT',%s,%s)
+        RETURNING id;
         """,
         (contact_id, body, Json(meta, dumps=_json_dumps)),
     ).fetchone()
     draft_id = str(draft_row["id"])
 
     db.execute(
-        "insert into timeline(contact_id, type, detail) values (%s,'NOTE','Initial docs request drafted (AI)');",
+        "INSERT INTO timeline(contact_id,type,detail) VALUES (%s,'NOTE','Initial docs request drafted (AI)');",
         (contact_id,),
     )
 
-    # auto-send decision (initial)
+    # 6) auto-send decision (INITIAL)
     now_utc = datetime.now(timezone.utc)
     allowed, decision_meta, when = should_autosend(
         {
@@ -353,14 +338,14 @@ def kickoff_docs_request(contact_id: str, db: Connection = Depends(db_conn)):
                 "require_approval_initial": bool(org["require_approval_initial"]),
                 "autosend_confidence_threshold": float(org["autosend_confidence_threshold"]),
                 "business_hours_tz": org["business_hours_tz"],
-                "business_hours_start": int(org["business_hours_start"]),
-                "business_hours_end": int(org["business_hours_end"]),
-                "cooldown_hours": int(org["cooldown_hours"]),
-                "max_daily_sends": int(org["max_daily_sends"]),
-                "grace_minutes": int(org["grace_minutes"]),
+                "business_hours_start": org["business_hours_start"],
+                "business_hours_end": org["business_hours_end"],
+                "cooldown_hours": org["cooldown_hours"],
+                "max_daily_sends": org["max_daily_sends"],
+                "grace_minutes": org["grace_minutes"],
             },
             "contact": {
-                "dnc": bool(c["dnc"]),
+                "dnc": c["dnc"],
                 "last_sent_at": c["last_sent_at"],
                 "sends_today": c["sends_today"],
             },
@@ -371,12 +356,12 @@ def kickoff_docs_request(contact_id: str, db: Connection = Depends(db_conn)):
     )
 
     db.execute(
-        "insert into timeline(contact_id, type, detail) values (%s,'AUTO_SEND_DECISION',%s);",
+        "INSERT INTO timeline(contact_id,type,detail) VALUES (%s,'AUTO_SEND_DECISION',%s);",
         (contact_id, Json({"message_id": draft_id, **(decision_meta or {})}, dumps=_json_dumps)),
     )
     db.commit()
 
-    # enqueue if allowed (best-effort)
+    # 7) enqueue send if allowed
     auto_enqueued = False
     scheduled_for = None
     if allowed:
@@ -392,7 +377,7 @@ def kickoff_docs_request(contact_id: str, db: Connection = Depends(db_conn)):
                 q.enqueue("app.jobs.send_message_and_update", draft_id, "EMAIL")
                 auto_enqueued = True
         except Exception:
-            # non-fatal; leave as draft
+            # leave as draft if queueing fails
             pass
 
     return {
@@ -409,7 +394,7 @@ def kickoff_docs_request(contact_id: str, db: Connection = Depends(db_conn)):
 # ---------------------------------------------------------------------
 
 @router.post("/review/approve")
-def approve_doc(payload: dict = Body(...), db: Connection = Depends(db_conn)):
+def approve_doc(payload: dict = Body(...), db: Connection = Depends(get_db)):
     contact_id = (payload.get("contact_id") or "").strip()
     requirement_id = (payload.get("requirement_id") or "").strip()
     if not contact_id or not requirement_id:
@@ -418,8 +403,8 @@ def approve_doc(payload: dict = Body(...), db: Connection = Depends(db_conn)):
     row = db.execute(
         """
         select id, status
-          from client_documents
-         where contact_id = %s and requirement_id = %s;
+        from client_documents
+        where contact_id = %s and requirement_id = %s
         """,
         (contact_id, requirement_id),
     ).fetchone()
@@ -430,20 +415,21 @@ def approve_doc(payload: dict = Body(...), db: Connection = Depends(db_conn)):
         """
         update client_documents
            set status = 'APPROVED',
-               reviewed_at = now(),
+               reviewed_at = %s,
                notes = notes
          where contact_id = %s
-           and requirement_id = %s;
+           and requirement_id = %s
         """,
-        (contact_id, requirement_id),
+        (datetime.now(timezone.utc), contact_id, requirement_id),
     )
 
-    # If checklist complete (no required pending), enqueue courtesy note
+    # If this approval completes the checklist (no required PENDING), cue a courteous confirmation
     if _all_required_pending_count(db, contact_id) == 0:
         try:
             q = get_queue()
             q.enqueue("app.jobs.on_all_docs_received", contact_id)
         except Exception:
+            # non-fatal: just skip the courtesy note if enqueue fails
             pass
 
     db.commit()
@@ -452,10 +438,10 @@ def approve_doc(payload: dict = Body(...), db: Connection = Depends(db_conn)):
 @router.post("/review/reject")
 def reject_upload(
     payload: dict = Body(...),
-    db: Connection = Depends(db_conn),
+    db: Connection = Depends(get_db),
 ):
-    contact_id = (payload.get("contact_id") or "").strip()
-    requirement_id = (payload.get("requirement_id") or "").strip()
+    contact_id = payload.get("contact_id")
+    requirement_id = payload.get("requirement_id")
     reason = (payload.get("reason") or "").strip()
     create_followup = bool(payload.get("create_followup_draft", True))
 
@@ -467,9 +453,7 @@ def reject_upload(
     row = db.execute(
         """
         update client_documents
-           set status = 'REJECTED',
-               notes = %s,
-               reviewed_at = now()
+           set status = 'REJECTED', notes = %s, reviewed_at = now()
          where contact_id = %s and requirement_id = %s
         returning id;
         """,
@@ -490,12 +474,12 @@ def reject_upload(
         msg = db.execute(
             """
             insert into messages (contact_id, channel, direction, body, meta)
-            values (%s, 'EMAIL', 'DRAFT', %s, %s)
+            values (%s,'EMAIL','DRAFT',%s,%s)
             returning id;
             """,
             (contact_id, body, Json({"intent": "doc_fix"}, dumps=_json_dumps)),
         ).fetchone()
-        followup = {"draft_id": str(msg["id"])}
+        followup = {"draft_id": msg["id"]}
 
     db.execute(
         "insert into timeline (contact_id, type, detail) values (%s,'NOTE','Document rejected');",
@@ -509,7 +493,7 @@ def reject_upload(
 # ---------------------------------------------------------------------
 
 @router.post("/magic-link/{contact_id}")
-def create_magic_link(contact_id: str, db: Connection = Depends(db_conn)):
+def create_magic_link(contact_id: str, db: Connection = Depends(get_db)):
     exists = db.execute("select 1 from contacts where id=%s;", (contact_id,)).fetchone()
     if not exists:
         raise HTTPException(404, "contact not found")
@@ -529,8 +513,10 @@ def create_magic_link(contact_id: str, db: Connection = Depends(db_conn)):
             db.commit()
             return {"token": token, "expires_at": expires_at.isoformat()}
         except Exception as e1:
-            try: db.rollback()
-            except Exception: pass
+            try:
+                db.rollback()
+            except Exception:
+                pass
             if not has_magic:
                 return _json500(f"portal_tokens insert failed and magic_links not present: {e1}")
             try:
@@ -545,8 +531,10 @@ def create_magic_link(contact_id: str, db: Connection = Depends(db_conn)):
                 db.commit()
                 return {"token": str(rec["token"]), "expires_at": expires_at.isoformat()}
             except Exception as e2:
-                try: db.rollback()
-                except Exception: pass
+                try:
+                    db.rollback()
+                except Exception:
+                    pass
                 return _json500(f"magic_links fallback failed: {e2}")
 
     elif has_magic:
@@ -562,15 +550,17 @@ def create_magic_link(contact_id: str, db: Connection = Depends(db_conn)):
             db.commit()
             return {"token": str(rec["token"]), "expires_at": expires_at.isoformat()}
         except Exception as e:
-            try: db.rollback()
-            except Exception: pass
+            try:
+                db.rollback()
+            except Exception:
+                pass
             return _json500(f"magic_links insert failed: {e}")
 
     else:
         return _json500("neither portal_tokens nor magic_links table exists; create one")
 
 @router.get("/portal/{token}")
-def portal_init(token: str, db: Connection = Depends(db_conn)):
+def portal_init(token: str, db: Connection = Depends(get_db)):
     try:
         rec = db.execute(
             """
@@ -581,9 +571,9 @@ def portal_init(token: str, db: Connection = Depends(db_conn)):
             )
             select t.contact_id, t.expires_at,
                    c.first_name, c.last_name, c.email, c.phone, c.matter_type
-              from t
-              join contacts c on c.id = t.contact_id
-             limit 1;
+            from t
+            join contacts c on c.id = t.contact_id
+            limit 1;
             """,
             (token, token),
         ).fetchone()
@@ -605,10 +595,10 @@ def portal_init(token: str, db: Connection = Depends(db_conn)):
                    cd.notes,
                    cd.uploaded_at,
                    cd.reviewed_at
-              from client_documents cd
-              join document_requirements dr on dr.id = cd.requirement_id
-             where cd.contact_id = %s
-             order by dr.label asc;
+            from client_documents cd
+            join document_requirements dr on dr.id = cd.requirement_id
+            where cd.contact_id = %s
+            order by dr.label asc;
             """,
             (rec["contact_id"],),
         ).fetchall()
@@ -634,10 +624,14 @@ def portal_init(token: str, db: Connection = Depends(db_conn)):
 def portal_upload(
     token: str,
     payload: dict = Body(...),
-    db: Connection = Depends(db_conn),
+    db: Connection = Depends(get_db),
 ):
     """
-    Record the upload, flip status to UPLOADED, and enqueue a polite follow-up.
+    Records the upload, flips status to UPLOADED, and enqueues an
+    on_client_upload follow-up that will:
+      - thank the client
+      - list remaining needs (naturally)
+      - or say “all set” if this was the last item
     """
     try:
         t = db.execute(
@@ -682,10 +676,12 @@ def portal_upload(
         )
         db.commit()
 
+        # Enqueue the thank-you/next-steps follow-up (thread-aware + natural)
         try:
             q = get_queue()
             q.enqueue("app.jobs.on_client_upload", contact_id, requirement_id)
         except Exception:
+            # non-fatal: upload succeeded
             pass
 
         return {"ok": True}
