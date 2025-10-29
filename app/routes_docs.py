@@ -15,7 +15,7 @@ from fastapi.responses import JSONResponse
 from psycopg import Connection
 from psycopg.types.json import Json
 
-from app.deps import get_db
+from app.deps import db_conn
 from app.queue import get_queue
 from app.decisions import should_autosend
 from app.followups import generate_initial_docs_request, _portal_url as build_portal_url
@@ -165,7 +165,7 @@ def _all_required_pending_count(db: Connection, contact_id: str) -> int:
 # ---------------------------------------------------------------------
 
 @router.get("/checklist/{contact_id}")
-def checklist(contact_id: str, db: Connection = Depends(get_db)):
+def checklist(contact_id: str, db: Connection = Depends(db_conn)):
     if not _contact_exists(db, contact_id):
         raise HTTPException(404, "contact not found")
 
@@ -207,7 +207,7 @@ def checklist(contact_id: str, db: Connection = Depends(get_db)):
 def add_custom_requirement(
     contact_id: str,
     payload: dict = Body(...),
-    db: Connection = Depends(get_db),
+    db: Connection = Depends(db_conn),
 ):
     if not _contact_exists(db, contact_id):
         raise HTTPException(404, "contact not found")
@@ -245,7 +245,7 @@ def add_custom_requirement(
 def bulk_add_requirements(
     contact_id: str,
     payload: dict = Body(...),
-    db: Connection = Depends(get_db),
+    db: Connection = Depends(db_conn),
 ):
     if not _contact_exists(db, contact_id):
         raise HTTPException(404, "contact not found")
@@ -286,7 +286,7 @@ def bulk_add_requirements(
 # ---------------------------------------------------------------------
 
 @router.post("/kickoff/{contact_id}")
-def kickoff_docs_request(contact_id: str, db: Connection = Depends(get_db)):
+def kickoff_docs_request(contact_id: str, db: Connection = Depends(db_conn)):
     c = _get_contact(db, contact_id)
     if not c:
         raise HTTPException(status_code=404, detail="Contact not found")
@@ -409,7 +409,7 @@ def kickoff_docs_request(contact_id: str, db: Connection = Depends(get_db)):
 # ---------------------------------------------------------------------
 
 @router.post("/review/approve")
-def approve_doc(payload: dict = Body(...), db: Connection = Depends(get_db)):
+def approve_doc(payload: dict = Body(...), db: Connection = Depends(db_conn)):
     contact_id = (payload.get("contact_id") or "").strip()
     requirement_id = (payload.get("requirement_id") or "").strip()
     if not contact_id or not requirement_id:
@@ -452,7 +452,7 @@ def approve_doc(payload: dict = Body(...), db: Connection = Depends(get_db)):
 @router.post("/review/reject")
 def reject_upload(
     payload: dict = Body(...),
-    db: Connection = Depends(get_db),
+    db: Connection = Depends(db_conn),
 ):
     contact_id = (payload.get("contact_id") or "").strip()
     requirement_id = (payload.get("requirement_id") or "").strip()
@@ -509,7 +509,7 @@ def reject_upload(
 # ---------------------------------------------------------------------
 
 @router.post("/magic-link/{contact_id}")
-def create_magic_link(contact_id: str, db: Connection = Depends(get_db)):
+def create_magic_link(contact_id: str, db: Connection = Depends(db_conn)):
     exists = db.execute("select 1 from contacts where id=%s;", (contact_id,)).fetchone()
     if not exists:
         raise HTTPException(404, "contact not found")
@@ -570,7 +570,7 @@ def create_magic_link(contact_id: str, db: Connection = Depends(get_db)):
         return _json500("neither portal_tokens nor magic_links table exists; create one")
 
 @router.get("/portal/{token}")
-def portal_init(token: str, db: Connection = Depends(get_db)):
+def portal_init(token: str, db: Connection = Depends(db_conn)):
     try:
         rec = db.execute(
             """
@@ -634,7 +634,7 @@ def portal_init(token: str, db: Connection = Depends(get_db)):
 def portal_upload(
     token: str,
     payload: dict = Body(...),
-    db: Connection = Depends(get_db),
+    db: Connection = Depends(db_conn),
 ):
     """
     Record the upload, flip status to UPLOADED, and enqueue a polite follow-up.
