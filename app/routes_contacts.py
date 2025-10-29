@@ -14,7 +14,7 @@ router = APIRouter(prefix="/contacts", tags=["contacts"])
 # List contacts (used by Inbox) - keep result set bounded
 # -------------------------------------------------------------------
 @router.get("")
-def list_contacts(limit: int = 200, db: Connection = Depends(get_db)):
+def list_contacts(limit: int = 200, db: Connection = Depends(db_conn)):
     # cap limit to something sane
     limit = max(1, min(limit, 500))
     with db.cursor() as cur:
@@ -35,7 +35,7 @@ def list_contacts(limit: int = 200, db: Connection = Depends(get_db)):
 # Fetch a single contact
 # -------------------------------------------------------------------
 @router.get("/{contact_id}")
-def get_contact(contact_id: str, db: Connection = Depends(get_db)):
+def get_contact(contact_id: str, db: Connection = Depends(db_conn)):
     with db.cursor() as cur:
         cur.execute(
             """
@@ -57,7 +57,7 @@ def get_contact(contact_id: str, db: Connection = Depends(get_db)):
 # hold the request's connection longer than needed.
 # -------------------------------------------------------------------
 @router.post("")
-def create_contact(payload: Dict[str, Any] = Body(...), db: Connection = Depends(get_db)):
+def create_contact(payload: Dict[str, Any] = Body(...), db: Connection = Depends(db_conn)):
     first = (payload.get("first_name") or "").strip() or None
     last  = (payload.get("last_name")  or "").strip() or None
     email = (payload.get("email")      or "").strip() or None
