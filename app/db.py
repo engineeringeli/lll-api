@@ -2,12 +2,11 @@
 from __future__ import annotations
 
 import os
-from contextlib import asynccontextmanager, contextmanager
-from typing import Iterator
-
-from psycopg_pool import ConnectionPool
-from psycopg import Connection
+from typing import Generator
 from urllib.parse import urlsplit, urlunsplit, urlencode, parse_qsl
+
+from psycopg import Connection
+from psycopg_pool import ConnectionPool
 
 # ---------- env ----------
 DATABASE_URL = os.getenv("DATABASE_URL", "")
@@ -47,7 +46,7 @@ def _augment_conninfo(url: str) -> str:
         options = f"{options} {extra}".strip() if options else extra
         q["options"] = options
 
-    # Rebuild query string correctly (BUGFIX: pass a mapping, not dict_items)
+    # Rebuild query string correctly
     new_query = urlencode(q, doseq=True)
     return urlunsplit((p.scheme, p.netloc, p.path, new_query, p.fragment))
 
@@ -83,8 +82,7 @@ def close_pool() -> None:
             pool = None
 
 
-@contextmanager
-def db_conn() -> Iterator[Connection]:
+def db_conn() -> Generator[Connection, None, None]:
     """
     FastAPI dependency: yields a pooled psycopg Connection.
     Commits on success, rolls back on exception.
@@ -103,3 +101,7 @@ def db_conn() -> Iterator[Connection]:
         except Exception:
             conn.rollback()
             raise
+
+
+# Optional alias if some modules import get_db
+get_db = db_conn
