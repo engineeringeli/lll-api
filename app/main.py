@@ -149,6 +149,9 @@ def health_db():
     # Use the pool (fast + representative of real traffic)
     try:
         # Quick ping through the pool
+        if pool is None:
+            open_pool()
+        assert pool is not None
         with pool.connection(timeout=float(os.getenv("DB_POOL_MAX_WAIT", "5"))) as conn:
             with conn.cursor() as cur:
                 cur.execute("SELECT 1;")
