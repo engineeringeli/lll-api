@@ -2,7 +2,7 @@
 from fastapi import APIRouter, Depends, HTTPException, Body
 from psycopg import Connection
 from typing import Optional, Dict, Any
-from app.deps import get_db
+from app.deps import db_conn
 
 # If your existing function must be reused:
 # It should accept (contact_id: str, payload: dict, db: Connection)
