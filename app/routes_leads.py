@@ -2,7 +2,7 @@ from fastapi import APIRouter, HTTPException, Depends, Request
 from pydantic import BaseModel, EmailStr, field_validator
 from psycopg import Connection
 from psycopg.types.json import Json
-from app.deps import get_db
+from app.deps import db_conn
 from app.routes_webhooks import norm_phone  # reuse normalizer
 from datetime import datetime
 
@@ -23,7 +23,7 @@ class LeadIn(BaseModel):
         return (v or "").strip()
 
 @router.post("")
-def create_lead(lead: LeadIn, db: Connection = Depends(get_db), request: Request = None):
+def create_lead(lead: LeadIn, db: Connection = Depends(db_conn), request: Request = None):
     # 1) Honeypot: if filled, quietly accept but do nothing
     if lead.honeypot and lead.honeypot.strip():
         return {"ok": True, "ignored": True}
