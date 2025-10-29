@@ -1,14 +1,17 @@
 # backend/app/deps.py
+from __future__ import annotations
 import os
 import time
 import logging
 from contextlib import contextmanager
-from typing import Iterator, Optional
+from typing import Generator, Iterator, Optional
+from psycopg import Connection
 
 import redis
 from psycopg.rows import dict_row
 from psycopg.errors import OperationalError
 from psycopg_pool import ConnectionPool
+from app.db import db_conn
 
 log = logging.getLogger("deps")
 
@@ -129,9 +132,10 @@ def _borrow():
     assert last_err is not None
     raise last_err
 
-def db_conn() -> Iterator:
-    with _borrow() as conn:
-        yield conn
+def get_db() -> Generator[Connection, None, None]:
+    """Yield a pooled psycopg Connection (same as app.db.db_conn)."""
+    # Delegate to the pooled dependency
+    yield from db_conn()
 
 def get_redis():
     if not REDIS_URL:
