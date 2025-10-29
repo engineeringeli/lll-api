@@ -12,9 +12,7 @@ from psycopg import Connection
 import psycopg
 import redis as _redis  # for health_redis()
 
-# Use your existing deps import, then override it with the pooled one on startup
-from app.deps import get_db as _legacy_get_db  # routers depend on this
-from app.db import db_conn, open_pool, close_pool, pool  # new pooled helpers
+from app.db import db_conn, open_pool, close_pool, pool  # pooled helpers
 
 # Queues / routes
 from app.routes_settings import router as org_router
@@ -30,9 +28,7 @@ try:
 except ModuleNotFoundError:
     from .queue import get_queue
 
-
 app = FastAPI(title="Lawyer Follow-up API")
-
 
 # =========================
 # CORS
@@ -52,23 +48,16 @@ app.add_middleware(
     allow_headers=["Authorization", "Content-Type"],
 )
 
-
 # =========================
-# Lifecycle: wire the pool + override legacy get_db
+# Lifecycle
 # =========================
 @app.on_event("startup")
 def _startup() -> None:
-    # Open the global pool once per process
-    open_pool()
-    # Make all routers that use app.deps.get_db consume pooled connections
-    app.dependency_overrides[_legacy_get_db] = db_conn  # <= important
-
+    open_pool()  # create pool once
 
 @app.on_event("shutdown")
 def _shutdown() -> None:
-    # Close the pool cleanly
     close_pool()
-
 
 # =========================
 # Utilities
@@ -77,7 +66,6 @@ def _mask_url(url: str) -> str:
     if not url:
         return ""
     try:
-        # rediss://:password@host:port or postgres://user:pass@host/db
         if "://" in url and "@" in url:
             scheme, rest = url.split("://", 1)
             userinfo, host = rest.split("@", 1)
@@ -88,7 +76,6 @@ def _mask_url(url: str) -> str:
     except Exception:
         return "<masked>"
 
-
 # =========================
 # Health endpoints
 # =========================
@@ -96,11 +83,9 @@ def _mask_url(url: str) -> str:
 def healthz():
     return {"ok": True}
 
-
 @app.get("/health")
 def health():
     return {"ok": True}
-
 
 @app.get("/health/env")
 def health_env():
@@ -122,7 +107,6 @@ def health_env():
         out[k] = _mask_url(v) if "URL" in k else (v if v else "")
     return {"env": out}
 
-
 @app.get("/health/redis")
 def health_redis():
     url = os.getenv("REDIS_URL", "")
@@ -143,12 +127,9 @@ def health_redis():
     except Exception as e:
         return {"ok": False, "redis_url": _mask_url(url), "error": str(e)}
 
-
 @app.get("/health/db")
 def health_db():
-    # Use the pool (fast + representative of real traffic)
     try:
-        # Quick ping through the pool
         if pool is None:
             open_pool()
         assert pool is not None
@@ -158,7 +139,6 @@ def health_db():
                 row = cur.fetchone()
         return {"ok": row == (1,), "via": "pool"}
     except Exception as e:
-        # Fallback: try direct connect to provide more hints
         url = os.getenv("DATABASE_URL", "")
         try:
             conn = psycopg.connect(url, connect_timeout=5)
@@ -176,7 +156,6 @@ def health_db():
                 "direct_error": f"{type(e2).__name__}: {e2}",
             }
 
-
 # =========================
 # Routers
 # =========================
@@ -188,16 +167,12 @@ app.include_router(webhooks_router)
 app.include_router(leads_router)
 app.include_router(docs_router)
 
-
 # =========================
 # Example endpoints (use pooled DB + queue)
 # =========================
 @app.get("/contacts")
 def contacts(conn: Connection = Depends(db_conn)):
-    """
-    Returns the newest contacts (id, name, email, phone, status).
-    Uses pooled connection via db_conn.
-    """
+    """Return newest contacts (id, name, email, phone, status)."""
     try:
         rows = conn.execute(
             """
@@ -211,16 +186,13 @@ def contacts(conn: Connection = Depends(db_conn)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"DB query failed: {e}")
 
-
 @app.post("/messages/send-email")
 def api_send_email(
     to_email: str = Body(..., embed=True),
     subject: str = Body(..., embed=True),
     body_text: str = Body(..., embed=True),
 ):
-    """
-    Enqueues an email send via RQ worker (app.jobs.send_email).
-    """
+    """Enqueue an email send via RQ worker (app.jobs.send_email)."""
     try:
         q = get_queue()
         job = q.enqueue("app.jobs.send_email", to_email, subject, body_text)
@@ -228,15 +200,12 @@ def api_send_email(
     except Exception as e:
         raise HTTPException(500, f"enqueue failed: {e}")
 
-
 @app.post("/messages/send-sms")
 def api_send_sms(
     to_number: str = Body(..., embed=True),
     body_text: str = Body(..., embed=True),
 ):
-    """
-    Enqueues an SMS send via RQ worker (app.jobs.send_sms).
-    """
+    """Enqueue an SMS send via RQ worker (app.jobs.send_sms)."""
     try:
         q = get_queue()
         job = q.enqueue("app.jobs.send_sms", to_number, body_text)
